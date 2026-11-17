@@ -828,7 +828,7 @@ server {{
                 DualLogger.warn(f"Could not write manifest to {p}: {e}")
 
     @staticmethod
-    def run_health_checks(puma_port: int = 3300) -> None:
+    def run_health_checks(puma_port: int = 3300, enable_ssl: bool = True) -> None:
         """Verify stack connectivity and service status."""
         DualLogger.step("Stack Health Check & Verification Matrix")
         services = ["postgresql", "redis-server", "redmine", "sidekiq", "nginx"]
@@ -887,16 +887,64 @@ server {{
         except Exception as e:
             DualLogger.warn(f"Nginx socket check exception: {e}")
 
-        DualLogger.info("Testing Nginx reverse proxy HTTPS port 443...")
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2.0)
-                if sock.connect_ex(("127.0.0.1", 443)) == 0:
-                    DualLogger.success("Nginx HTTPS port 443 is accepting connections.")
-                else:
-                    DualLogger.warn("Nginx HTTPS port 443 is not answering.")
-        except Exception as e:
-            DualLogger.warn(f"Nginx HTTPS socket check exception: {e}")
+        if enable_ssl:
+            DualLogger.info("Testing Nginx reverse proxy HTTPS port 443...")
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2.0)
+                    if sock.connect_ex(("127.0.0.1", 443)) == 0:
+                        DualLogger.success("Nginx HTTPS port 443 is accepting connections.")
+                    else:
+                        DualLogger.warn("Nginx HTTPS port 443 is not answering.")
+            except Exception as e:
+                DualLogger.warn(f"Nginx HTTPS socket check exception: {e}")
+
+    @staticmethod
+    def print_post_deployment_instructions(cfg: ServiceConfig) -> None:
+        """Print clear operational instructions tailored to HTTP vs HTTPS and domain choice."""
+        print(f"\n{AnsiColor.GREEN}{'='*76}")
+        print("  REDMINE 7.0.3 PLATINUM SERVICES OPERATION COMPLETE")
+        print(f"{'='*76}{AnsiColor.RESET}\n")
+
+        access_proto = "https" if cfg.enable_ssl else "http"
+        domain_display = cfg.domain_name if cfg.domain_name != "_" else "127.0.0.1"
+        port_suffix = "" if cfg.enable_ssl or cfg.puma_port == 80 else ""
+
+        print(f"{AnsiColor.BOLD}Post-Deployment Access & Operations Instructions:{AnsiColor.RESET}")
+        print(f"  1. Web Access: {access_proto}://{domain_display}{port_suffix}/")
+        if cfg.enable_ssl:
+            print(f"     SSL Mode: [ENABLED - HTTPS via Port 443 with Port 80 Redirect]")
+            print(f"     Note: Since a self-signed SSL certificate is used, your browser will show a warning.")
+            print(f"     Click 'Advanced' -> 'Proceed to {domain_display} (unsafe)' to proceed.")
+        else:
+            print(f"     SSL Mode: [DISABLED - Plain HTTP via Port 80]")
+            print(f"     Note: Traffic is unencrypted. Accessible directly over HTTP.")
+
+        print(f"  2. Service Controls:")
+        print(f"     sudo systemctl status redmine    # Puma Web Server")
+        print(f"     sudo systemctl status sidekiq    # Background Worker")
+        print(f"     sudo systemctl status nginx      # Reverse Proxy")
+
+        if domain_display not in ["127.0.0.1", "localhost", "_"]:
+            subdomain_prefix = domain_display.split(".")[0] if "." in domain_display else domain_display
+            print(f"  3. DNS Records Configuration (Action Required for Public Access):")
+            print(f"     - CNAME Record: In your DNS manager, point:")
+            print(f"         Type: CNAME | Name: {subdomain_prefix} | Target: <your-server-hostname>")
+            print(f"         (Or Type: A | Name: {subdomain_prefix} | Value: <your-server-public-ip>)")
+            print(f"     - Local Testing: Add '127.0.0.1 {domain_display}' to /etc/hosts for instant testing.")
+            print(f"  4. Email Delivery & Mail Records (For Sendmail / ActionMailer):")
+            print(f"     - SPF TXT Record: Authorize this server to send notifications without spam classification:")
+            print(f"         Type: TXT | Name: @ | Value: v=spf1 ip4:<your-server-public-ip> ~all")
+            print(f"     - MX Record: Only required if configuring Redmine to receive incoming email for issues.")
+        else:
+            print(f"  3. Local Testing & Production DNS Guidance:")
+            print(f"     - If using a domain like redmine.synorastudio.in later, add CNAME: redmine -> server hostname.")
+            print(f"     - Set up an SPF record (v=spf1 ip4:<SERVER_IP> ~all) if using Sendmail notifications.")
+
+        manifest_file = cfg.redmine_root / "redmine_services_manifest.json"
+        print(f"  4. Deployment Manifest:")
+        print(f"     {manifest_file}")
+        print(f"     {Path(__file__).resolve().parent / 'redmine_services_manifest.json'}\n")
 
 
 def prompt_user_configuration(redmine_root: Path, is_reconfigure: bool = False) -> ServiceConfig:
@@ -1000,7 +1048,9 @@ def show_interactive_menu(setup_state: dict[str, bool], redmine_root: Path) -> N
         mgr.configure_nginx()
         SystemInspector.run_command(["systemctl", "restart", "redmine"])
         SystemInspector.run_command(["systemctl", "restart", "sidekiq"])
-        ServiceManager.run_health_checks(cfg.puma_port)
+        ServiceManager.export_manifest(cfg)
+        ServiceManager.run_health_checks(cfg.puma_port, cfg.enable_ssl)
+        ServiceManager.print_post_deployment_instructions(cfg)
     elif choice == "2":
         puma_port = 3300
         puma_conf = redmine_root / "config" / "puma.rb"
@@ -1030,7 +1080,9 @@ def show_interactive_menu(setup_state: dict[str, bool], redmine_root: Path) -> N
         mgr.configure_nginx()
         SystemInspector.run_command(["systemctl", "restart", "redmine"])
         SystemInspector.run_command(["systemctl", "restart", "sidekiq"])
-        ServiceManager.run_health_checks(cfg.puma_port)
+        ServiceManager.export_manifest(cfg)
+        ServiceManager.run_health_checks(cfg.puma_port, cfg.enable_ssl)
+        ServiceManager.print_post_deployment_instructions(cfg)
     else:
         DualLogger.info("Exiting without making changes.")
         sys.exit(0)
@@ -1073,46 +1125,8 @@ def main() -> None:
             SystemInspector.run_command(["systemctl", "restart", "redmine"])
             SystemInspector.run_command(["systemctl", "restart", "sidekiq"])
             ServiceManager.export_manifest(cfg)
-            ServiceManager.run_health_checks(cfg.puma_port)
-
-        print(f"\n{AnsiColor.GREEN}{'='*76}")
-        print("  REDMINE 7.0.3 PLATINUM SERVICES OPERATION COMPLETE")
-        print(f"{'='*76}{AnsiColor.RESET}\n")
-
-        access_proto = "https" if getattr(locals().get("cfg", None), "enable_ssl", True) else "http"
-        domain_display = getattr(locals().get("cfg", None), "domain_name", "localhost")
-        if domain_display == "_":
-            domain_display = "127.0.0.1"
-
-        print(f"{AnsiColor.BOLD}Post-Deployment Access & Operations Instructions:{AnsiColor.RESET}")
-        print(f"  1. Web Access: {access_proto}://{domain_display}/")
-        if access_proto == "https":
-            print(f"     Note: Since a self-signed SSL certificate is used, your browser will show a warning.")
-            print(f"     Click 'Advanced' -> 'Proceed to {domain_display} (unsafe)' to proceed.")
-        print(f"  2. Service Controls:")
-        print(f"     sudo systemctl status redmine    # Puma Web Server")
-        print(f"     sudo systemctl status sidekiq    # Background Worker")
-        print(f"     sudo systemctl status nginx      # Reverse Proxy")
-
-        if domain_display not in ["127.0.0.1", "localhost", "_"]:
-            subdomain_prefix = domain_display.split(".")[0] if "." in domain_display else domain_display
-            print(f"  3. DNS Records Configuration (Action Required for Public Access):")
-            print(f"     - CNAME Record: In your DNS manager, point:")
-            print(f"         Type: CNAME | Name: {subdomain_prefix} | Target: <your-server-hostname>")
-            print(f"         (Or Type: A | Name: {subdomain_prefix} | Value: <your-server-public-ip>)")
-            print(f"     - Local Testing: Add '127.0.0.1 {domain_display}' to /etc/hosts for instant testing.")
-            print(f"  4. Email Delivery & Mail Records (For Sendmail / ActionMailer):")
-            print(f"     - SPF TXT Record: Authorize this server to send notifications without spam classification:")
-            print(f"         Type: TXT | Name: @ | Value: v=spf1 ip4:<your-server-public-ip> ~all")
-            print(f"     - MX Record: Only required if configuring Redmine to receive incoming email for issues.")
-        else:
-            print(f"  3. Local Testing:")
-            print(f"     - If using a domain like redmine.synorastudio.in later, add CNAME: redmine -> server hostname.")
-            print(f"     - Set up an SPF record (v=spf1 ip4:<SERVER_IP> ~all) if using Sendmail notifications.")
-
-        print(f"  4. Deployment Manifest:")
-        print(f"     /data/redmine/redmine_services_manifest.json")
-        print(f"     {Path(__file__).resolve().parent / 'redmine_services_manifest.json'}\n")
+            ServiceManager.run_health_checks(cfg.puma_port, cfg.enable_ssl)
+            ServiceManager.print_post_deployment_instructions(cfg)
 
     except Exception as e:
         DualLogger.error(f"Execution terminated with error: {e}")

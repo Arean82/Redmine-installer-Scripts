@@ -1157,7 +1157,7 @@ server {{
             DualLogger.error(f"Nginx syntax error: {t_res.stderr.strip()}")
 
     @staticmethod
-    def run_health_checks(port: int, redmine_root: Path) -> None:
+    def run_health_checks(port: int, redmine_root: Path, enable_ssl: bool = True) -> None:
         DualLogger.step("Live Health & Verification Matrix")
 
         services = ["postgresql", "redis-server", "redmine", "sidekiq", "nginx"]
@@ -1183,7 +1183,11 @@ server {{
             DualLogger.warn(f"Local HTTP Socket probe notice: {e}")
 
         # Check Nginx HTTP port 80 and HTTPS port 443
-        for check_port, check_label in [(80, "Nginx HTTP Port 80"), (443, "Nginx HTTPS Port 443")]:
+        check_list = [(80, "Nginx HTTP Port 80")]
+        if enable_ssl:
+            check_list.append((443, "Nginx HTTPS Port 443"))
+
+        for check_port, check_label in check_list:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.settimeout(2.0)
@@ -1496,7 +1500,7 @@ def execute_full_deployment(manifest_path: Path) -> None:
     SystemInspector.run_command(["systemctl", "restart", "redmine"])
     SystemInspector.run_command(["systemctl", "restart", "sidekiq"])
     installer.export_manifest(svc_params)
-    ServicesManager.run_health_checks(svc_params.puma_port, svc_params.redmine_root)
+    ServicesManager.run_health_checks(svc_params.puma_port, svc_params.redmine_root, svc_params.enable_ssl)
 
     print(f"\n{AnsiColor.GREEN}{'='*76}")
     print("  PLATINUM REDMINE FULL DEPLOYMENT COMPLETE & OPERATIONAL")
@@ -1508,8 +1512,13 @@ def execute_full_deployment(manifest_path: Path) -> None:
     print(f"{AnsiColor.BOLD}Post-Deployment Access & Operations Instructions:{AnsiColor.RESET}")
     print(f"  1. Web Access: {access_proto}://{domain_display}/")
     if svc_params.enable_ssl:
+        print(f"     SSL Mode: [ENABLED - HTTPS via Port 443 with Port 80 Redirect]")
         print(f"     Note: Since a self-signed SSL certificate is used, your browser will show a warning.")
         print(f"     Click 'Advanced' -> 'Proceed to {domain_display} (unsafe)' to proceed.")
+    else:
+        print(f"     SSL Mode: [DISABLED - Plain HTTP via Port 80]")
+        print(f"     Note: Traffic is unencrypted. Accessible directly over HTTP.")
+
     print(f"  2. Service Controls:")
     print(f"     sudo systemctl status redmine    # Puma Web Server")
     print(f"     sudo systemctl status sidekiq    # Background Worker")
@@ -1527,7 +1536,7 @@ def execute_full_deployment(manifest_path: Path) -> None:
         print(f"         Type: TXT | Name: @ | Value: v=spf1 ip4:<your-server-public-ip> ~all")
         print(f"     - MX Record: Only required if configuring Redmine to receive incoming email for issues.")
     else:
-        print(f"  3. Local Testing:")
+        print(f"  3. Local Testing & Production DNS Guidance:")
         print(f"     - If using a domain like redmine.synorastudio.in later, add CNAME: redmine -> server hostname.")
         print(f"     - Set up an SPF record (v=spf1 ip4:<SERVER_IP> ~all) if using Sendmail notifications.")
 
