@@ -40,7 +40,7 @@ Production-grade automated installation and lifecycle management scripts for **R
 
 ## Requirements
 
-- **Operating System:** Ubuntu 22.04 / 24.04 LTS or Debian 11 / 12
+- **Operating System:** Ubuntu 22.04 / 24.04 / 26.04 LTS or Debian 11 / 12
 - **Python:** Python 3.8+
 - **Privileges:** Root or `sudo` access
 - **Target Components:** PostgreSQL, Nginx, Redis, Systemd
