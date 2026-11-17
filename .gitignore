@@ -1,0 +1,18 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Manifests and local runtime credentials
+redmine_install_manifest.json
+*.pid
+*.sock
+*.log
+
+# Environment & temporary files
+.env
+.venv/
+env/
+venv/
+.DS_Store
+Thumbs.db
