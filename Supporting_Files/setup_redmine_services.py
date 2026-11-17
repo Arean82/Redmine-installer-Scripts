@@ -840,4 +840,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{AnsiColor.YELLOW}[NOTICE] Services setup cancelled by user. Exiting cleanly.{AnsiColor.RESET}\n")
+        sys.exit(130)
