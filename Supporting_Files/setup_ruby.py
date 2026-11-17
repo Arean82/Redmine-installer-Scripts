@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import glob
 import os
+import pty
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -85,22 +87,66 @@ class CommandExecutor:
         capture: bool = False,
         env: dict[str, str] | None = None,
     ) -> str:
-        """Execute a shell command with standard diagnostic handling."""
+        """Execute a shell command with PTY virtual terminal allocation."""
+        sub_env = (env.copy() if env else os.environ.copy())
+        sub_env["TERM"] = "xterm-256color"
+        sub_env["CI"] = "true"
+
+        master, slave = pty.openpty()
         try:
-            res = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
-                check=check,
-                capture_output=capture,
-                text=True,
-                env=env,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+                env=sub_env
             )
-            return res.stdout.strip() if capture else ""
-        except subprocess.CalledProcessError as exc:
-            Logger.error(f"Execution failed for command: '{command}'")
-            if capture and exc.stderr:
-                Logger.error(exc.stderr.strip())
-            raise
+            os.close(slave)
+            output_chunks: list[str] = []
+            while True:
+                r, _, _ = select.select([master], [], [], 0.1)
+                if master in r:
+                    try:
+                        data = os.read(master, 2048)
+                        if not data:
+                            break
+                        decoded = data.decode("utf-8", errors="replace")
+                        output_chunks.append(decoded)
+                        if not capture:
+                            sys.stdout.write(decoded)
+                            sys.stdout.flush()
+                    except OSError:
+                        break
+                elif proc.poll() is not None:
+                    try:
+                        while True:
+                            r_remain, _, _ = select.select([master], [], [], 0.05)
+                            if master not in r_remain:
+                                break
+                            data = os.read(master, 2048)
+                            if not data:
+                                break
+                            decoded = data.decode("utf-8", errors="replace")
+                            output_chunks.append(decoded)
+                            if not capture:
+                                sys.stdout.write(decoded)
+                                sys.stdout.flush()
+                    except OSError:
+                        pass
+                    break
+            proc.wait()
+            total_output = "".join(output_chunks).strip()
+            if check and proc.returncode != 0:
+                Logger.error(f"Execution failed for command: '{command}'")
+                raise subprocess.CalledProcessError(proc.returncode, command, output=total_output)
+            return total_output if capture else ""
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -504,6 +550,29 @@ class RubyProvisionerCLI:
         print(f" {AnsiColor.BOLD}Configured Shims Path:{AnsiColor.RESET}   {rbenv_manager.shims_dir}")
         print(f"{AnsiColor.BOLD}{AnsiColor.CYAN}{'=' * 70}{AnsiColor.RESET}\n")
         Logger.info(f"Reload your shell using 'source {rbenv_manager.home}/.bashrc' to apply changes.")
+
+        # Export Ruby environment manifest
+        try:
+            import json
+            import datetime
+            ruby_manifest_data = {
+                "operation": "Ruby Environment Provisioning",
+                "timestamp": datetime.datetime.now().astimezone().isoformat(),
+                "target_user": target_user,
+                "target_home": str(rbenv_manager.home),
+                "rbenv_root": str(rbenv_manager.rbenv_dir),
+                "shims_dir": str(rbenv_manager.shims_dir),
+                "selected_version": chosen_version,
+                "verified_ruby": verified_ruby,
+                "verified_bundler": verified_bundle,
+                "ruby_executable": f"{rbenv_manager.shims_dir}/ruby",
+                "bundle_executable": f"{rbenv_manager.shims_dir}/bundle"
+            }
+            manifest_file = Path(__file__).resolve().parent / "ruby_provision_manifest.json"
+            manifest_file.write_text(json.dumps(ruby_manifest_data, indent=2), encoding="utf-8")
+            Logger.info(f"Ruby provisioning manifest saved: {manifest_file}")
+        except Exception as e:
+            Logger.warn(f"Failed to write ruby manifest JSON: {e}")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,9 @@ import datetime
 import html
 import json
 import os
+import pty
 import secrets
+import select
 import shutil
 import string
 import subprocess
@@ -154,23 +156,32 @@ class SystemInspector:
 
     @staticmethod
     def run_command(cmd: list[str] | str, check: bool = True, as_user: str | None = None, shell: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-        if as_user and as_user != os.environ.get("USER", ""):
-            if isinstance(cmd, list):
-                cmd_str = " ".join(f"'{arg}'" if " " in arg or "$" in arg else arg for arg in cmd)
-            else:
-                cmd_str = cmd
-            full_cmd = ["sudo", "-u", as_user, "bash", "-c", cmd_str]
-            res = subprocess.run(full_cmd, check=check, text=True, capture_output=True, env=env)
-            DualLogger.write_disk(f"Command (as {as_user}): {cmd_str} -> ReturnCode: {res.returncode}")
+        sub_env = (env.copy() if env else os.environ.copy())
+        sub_env["TERM"] = "dumb"
+        sub_env["CI"] = "true"
+
+        try:
+            if as_user and as_user != os.environ.get("USER", ""):
+                if isinstance(cmd, list):
+                    cmd_str = " ".join(f"'{arg}'" if " " in arg or "$" in arg else arg for arg in cmd)
+                else:
+                    cmd_str = cmd
+                full_cmd = ["sudo", "-u", as_user, "env", "TERM=dumb", "CI=true", "bash", "-c", cmd_str]
+                res = subprocess.run(full_cmd, check=check, text=True, env=sub_env)
+                DualLogger.write_disk(f"Command (as {as_user}): {cmd_str} -> ReturnCode: {res.returncode}")
+                return res
+
+            if isinstance(cmd, str) and not shell:
+                import shlex
+                cmd = shlex.split(cmd)
+
+            res = subprocess.run(cmd, check=check, text=True, shell=shell, env=sub_env)
+            DualLogger.write_disk(f"Command: {cmd} -> ReturnCode: {res.returncode}")
             return res
-
-        if isinstance(cmd, str) and not shell:
-            import shlex
-            cmd = shlex.split(cmd)
-
-        res = subprocess.run(cmd, check=check, text=True, capture_output=True, shell=shell, env=env)
-        DualLogger.write_disk(f"Command: {cmd} -> ReturnCode: {res.returncode}")
-        return res
+        except subprocess.CalledProcessError as e:
+            if e.returncode in [1, 130]:
+                raise KeyboardInterrupt from e
+            raise
 
     @staticmethod
     def is_command_available(command: str) -> bool:

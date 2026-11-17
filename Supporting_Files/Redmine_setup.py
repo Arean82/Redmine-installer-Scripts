@@ -29,7 +29,9 @@ import datetime
 import html
 import json
 import os
+import pty
 import secrets
+import select
 import shutil
 import socket
 import string
@@ -164,6 +166,9 @@ class ServiceParams:
     enable_dev_service: bool = False
     enable_test_service: bool = False
     configure_sendmail: bool = False
+    enable_ssl: bool = True
+    ssl_cert_path: Path = field(default_factory=lambda: Path("/etc/ssl/redmine/redmine.crt"))
+    ssl_key_path: Path = field(default_factory=lambda: Path("/etc/ssl/redmine/redmine.key"))
 
 
 @dataclass(frozen=True)
@@ -201,15 +206,32 @@ class SystemInspector:
 
     @staticmethod
     def run_command(cmd: list[str] | str, check: bool = True, as_user: str | None = None, shell: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-        final_cmd = cmd
-        if as_user and as_user != "root":
-            if isinstance(cmd, list):
-                final_cmd = ["sudo", "-u", as_user] + cmd
-            else:
-                final_cmd = f"sudo -u {as_user} bash -c '{cmd}'"
-                shell = True
+        sub_env = (env.copy() if env else os.environ.copy())
+        sub_env["TERM"] = "dumb"
+        sub_env["CI"] = "true"
 
-        return subprocess.run(final_cmd, check=check, shell=shell, env=env, capture_output=True, text=True)
+        try:
+            if as_user and as_user != "root":
+                if isinstance(cmd, list):
+                    cmd_str = " ".join(f"'{arg}'" if " " in arg or "$" in arg else arg for arg in cmd)
+                else:
+                    cmd_str = cmd
+                full_cmd = ["sudo", "-u", as_user, "env", "TERM=dumb", "CI=true", "bash", "-c", cmd_str]
+                res = subprocess.run(full_cmd, check=check, text=True, env=sub_env)
+                DualLogger.write_disk(f"Command (as {as_user}): {cmd_str} -> ReturnCode: {res.returncode}")
+                return res
+
+            if isinstance(cmd, str) and not shell:
+                import shlex
+                cmd = shlex.split(cmd)
+
+            res = subprocess.run(cmd, check=check, text=True, shell=shell, env=sub_env)
+            DualLogger.write_disk(f"Command: {cmd} -> ReturnCode: {res.returncode}")
+            return res
+        except subprocess.CalledProcessError as e:
+            if e.returncode in [1, 130]:
+                raise KeyboardInterrupt from e
+            raise
 
     @staticmethod
     def is_command_available(command: str) -> bool:
@@ -617,8 +639,8 @@ test:
         SystemInspector.run_command(["chmod", "775", str(pid_dir)])
         DualLogger.success(f"Runtime PID directory ready: {pid_dir}")
 
-    def export_manifest(self) -> None:
-        DualLogger.step("Exporting Installation Manifest JSON")
+    def export_manifest(self, svc_params: ServiceParams | None = None) -> None:
+        DualLogger.step("Exporting Installation & Services Manifest JSON")
 
         manifest_data = {
             "timestamp": datetime.datetime.now().isoformat(),
@@ -669,6 +691,34 @@ test:
             }
         }
 
+        if svc_params:
+            manifest_data["services"] = {
+                "puma": {
+                    "port": svc_params.puma_port,
+                    "workers": svc_params.puma_workers,
+                    "config_file": str(svc_params.redmine_root / "config" / "puma.rb"),
+                    "systemd_service": "redmine.service"
+                },
+                "sidekiq": {
+                    "config_file": str(svc_params.redmine_root / "config" / "sidekiq.yml"),
+                    "systemd_service": "sidekiq.service"
+                },
+                "nginx": {
+                    "domain_name": svc_params.domain_name,
+                    "http_port": 80,
+                    "https_port": 443 if svc_params.enable_ssl else None,
+                    "ssl_enabled": svc_params.enable_ssl,
+                    "ssl_cert": str(svc_params.ssl_cert_path) if svc_params.enable_ssl else None,
+                    "ssl_key": str(svc_params.ssl_key_path) if svc_params.enable_ssl else None,
+                    "vhost_config": "/etc/nginx/sites-available/redmine"
+                },
+                "dns_and_mail_guidelines": {
+                    "cname_record": f"CNAME | {svc_params.domain_name.split('.')[0] if '.' in svc_params.domain_name else svc_params.domain_name} -> <target-hostname>" if svc_params.domain_name not in ["_", "localhost"] else "N/A (Local / Catch-all IP binding)",
+                    "spf_record": "TXT | @ -> v=spf1 ip4:<SERVER_PUBLIC_IP> ~all (Recommended for outbound Sendmail)",
+                    "mx_record": f"MX | 10 {svc_params.domain_name} (Only needed if receiving incoming mail for issue processing)" if svc_params.domain_name not in ["_", "localhost"] else "N/A"
+                }
+            }
+
         try:
             self.manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
             SystemInspector.run_command(["chmod", "660", str(self.manifest_path)])
@@ -694,6 +744,34 @@ class ServicesManager:
 
     def configure_puma(self) -> None:
         DualLogger.step("Section 11: Generating Puma Production Server Configuration (config/puma.rb)")
+
+        # Ensure Gemfile.local has enterprise dependencies and run bundle install
+        gemfile_local = self.cfg.redmine_root / "Gemfile.local"
+        required_gems = ["puma", "sidekiq", "observer", "slim-rails", "xapian-ruby"]
+        existing_content = gemfile_local.read_text(encoding="utf-8") if gemfile_local.exists() else ""
+        gems_to_add = [g for g in required_gems if f"'{g}'" not in existing_content and f'"{g}"' not in existing_content]
+        if gems_to_add:
+            DualLogger.info(f"Adding enterprise gems to Gemfile.local: {', '.join(gems_to_add)}")
+            addition = "\n".join(f"gem '{g}'" for g in gems_to_add) + "\n"
+            gemfile_local.write_text(existing_content + ("\n" if existing_content and not existing_content.endswith("\n") else "") + addition, encoding="utf-8")
+            SystemInspector.run_command(["chown", f"{self.cfg.redmine_user}:{self.cfg.shared_group}", str(gemfile_local)])
+            SystemInspector.run_command(["chmod", "664", str(gemfile_local)])
+
+        # Check if bundle is already satisfied so we avoid redundant network checks
+        rbenv_shims = f"/home/{self.cfg.redmine_user}/.rbenv/shims"
+        check_cmd = f"cd '{self.cfg.redmine_root}' && {rbenv_shims}/bundle check"
+        res_check = SystemInspector.run_command(check_cmd, check=False, as_user=self.cfg.redmine_user, shell=True)
+        if res_check.returncode == 0:
+            DualLogger.success("All Ruby gems already satisfied locally. Preserving existing gems.")
+        else:
+            r_res = subprocess.run(f"sudo -u {self.cfg.redmine_user} env TERM=dumb CI=true bash -c '{rbenv_shims}/ruby -v'", shell=True, capture_output=True, text=True)
+            ruby_ver = r_res.stdout.strip() if r_res.stdout else "Unknown"
+            DualLogger.info(f"Target User: {self.cfg.redmine_user} | Ruby Runtime: {ruby_ver}")
+            DualLogger.info("Resolving and installing enterprise gems via bundle install...")
+            bundle_cmd = f"cd '{self.cfg.redmine_root}' && {rbenv_shims}/bundle config set without 'development test' && {rbenv_shims}/bundle install"
+            SystemInspector.run_command(bundle_cmd, as_user=self.cfg.redmine_user, shell=True)
+            DualLogger.success("Bundler resolved and installed required gems successfully.")
+
         puma_rb = self.cfg.redmine_root / "config" / "puma.rb"
         content = f"""# Puma Application Server Configuration (Platinum Provisioned)
 threads {self.cfg.puma_min_threads}, {self.cfg.puma_max_threads}
@@ -870,7 +948,8 @@ WantedBy=multi-user.target
 
     def run_plugin_migrations_and_assets(self) -> None:
         DualLogger.step("Section 16: Migrating Plugins, Publishing Assets, and Sanitizing Cache")
-        cmd_env = f"cd '{self.cfg.redmine_root}' && RAILS_ENV=production {self.rbenv_shims}/bundle exec "
+        rbenv_shims = f"/home/{self.cfg.redmine_user}/.rbenv/shims"
+        exec_prefix = f"cd '{self.cfg.redmine_root}' && RAILS_ENV=production {rbenv_shims}/bundle exec "
 
         commands = [
             ("rake redmine:plugins:migrate", "Plugin Database Migrations"),
@@ -882,10 +961,11 @@ WantedBy=multi-user.target
         for sub_cmd, label in commands:
             DualLogger.info(f"Executing: {label}...")
             try:
-                SystemInspector.run_command(cmd_env + sub_cmd, as_user=self.cfg.redmine_user, shell=True)
-                DualLogger.success(f"Completed: {label}")
+                SystemInspector.run_command(exec_prefix + sub_cmd, as_user=self.cfg.redmine_user, shell=True)
+                DualLogger.success(f"Completed: {label}\n")
             except subprocess.CalledProcessError as e:
-                DualLogger.warn(f"{label} notice: {e.stderr.strip()[:100]}")
+                err_msg = (e.stderr or e.output or "Error occurred").strip().splitlines()[0] if (e.stderr or e.output) else "Execution failed"
+                DualLogger.warn(f"{label} notice: {err_msg}\n")
 
     def configure_dev_and_test_services(self) -> None:
         if self.cfg.enable_dev_service:
@@ -939,13 +1019,87 @@ WantedBy=multi-user.target
             DualLogger.success("Installed redmine-test.service (Start manually via: sudo systemctl start redmine-test)")
 
     def configure_nginx(self) -> None:
-        DualLogger.step("Section 19: Installing & Validating Nginx Reverse Proxy")
+        DualLogger.step("Section 19: Installing & Validating Nginx Reverse Proxy with HTTPS Support")
         if not SystemInspector.is_command_available("nginx"):
             DualLogger.info("Installing nginx package...")
             SystemInspector.run_command(["apt", "install", "-y", "nginx"])
 
         vhost_path = Path("/etc/nginx/sites-available/redmine")
-        vhost_content = f"""# Redmine Nginx Reverse Proxy Configuration (Platinum Provisioned)
+
+        if self.cfg.enable_ssl:
+            ssl_dir = self.cfg.ssl_cert_path.parent
+            ssl_dir.mkdir(parents=True, exist_ok=True)
+            if not self.cfg.ssl_cert_path.exists() or not self.cfg.ssl_key_path.exists():
+                DualLogger.info("Generating 2048-bit RSA self-signed SSL certificate...")
+                gen_cmd = [
+                    "openssl", "req", "-x509", "-nodes", "-days", "365",
+                    "-newkey", "rsa:2048",
+                    "-keyout", str(self.cfg.ssl_key_path),
+                    "-out", str(self.cfg.ssl_cert_path),
+                    "-subj", f"/C=IN/ST=IT/L=Server/O=Redmine/OU=IT/CN={self.cfg.domain_name}"
+                ]
+                res_ssl = subprocess.run(gen_cmd, capture_output=True, text=True)
+                if res_ssl.returncode == 0:
+                    DualLogger.success(f"Self-signed SSL certificate generated: {self.cfg.ssl_cert_path}")
+                else:
+                    DualLogger.error(f"SSL certificate generation failed: {res_ssl.stderr.strip()}")
+                    raise RuntimeError("SSL certificate generation failed.")
+
+            vhost_content = f"""# Redmine Nginx Reverse Proxy Configuration (Platinum Provisioned - HTTPS Hardened)
+upstream redmine_puma {{
+    server 127.0.0.1:{self.cfg.puma_port} fail_timeout=0;
+}}
+
+# HTTP -> HTTPS Redirect
+server {{
+    listen 80;
+    server_name {self.cfg.domain_name};
+    return 301 https://$host$request_uri;
+}}
+
+# HTTPS Server
+server {{
+    listen 443 ssl;
+    server_name {self.cfg.domain_name};
+
+    ssl_certificate {self.cfg.ssl_cert_path};
+    ssl_certificate_key {self.cfg.ssl_key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root {self.cfg.redmine_root}/public;
+    client_max_body_size 64M;
+
+    access_log /var/log/nginx/redmine_access.log;
+    error_log /var/log/nginx/redmine_error.log;
+
+    location / {{
+        try_files $uri/index.html $uri.html $uri @puma;
+    }}
+
+    location @puma {{
+        proxy_pass http://redmine_puma;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }}
+
+    location ~ ^/(assets|plugin_assets)/ {{
+        gzip_static on;
+        expires max;
+        add_header Cache-Control public;
+    }}
+}}
+"""
+        else:
+            vhost_content = f"""# Redmine Nginx Reverse Proxy Configuration (Platinum Provisioned)
 upstream redmine_puma {{
     server 127.0.0.1:{self.cfg.puma_port} fail_timeout=0;
 }}
@@ -1028,14 +1182,26 @@ server {{
         except Exception as e:
             DualLogger.warn(f"Local HTTP Socket probe notice: {e}")
 
+        # Check Nginx HTTP port 80 and HTTPS port 443
+        for check_port, check_label in [(80, "Nginx HTTP Port 80"), (443, "Nginx HTTPS Port 443")]:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2.0)
+                    if sock.connect_ex(("127.0.0.1", check_port)) == 0:
+                        DualLogger.success(f"{check_label} is accepting connections.")
+                    else:
+                        DualLogger.warn(f"{check_label} is not answering.")
+            except Exception as e:
+                DualLogger.warn(f"{check_label} probe exception: {e}")
+
     @staticmethod
     def uninstall(redmine_root: Path) -> None:
         DualLogger.step("Safe Complete Uninstall / Teardown of Redmine Services")
         print(f"{AnsiColor.YELLOW}This operation will stop and remove Redmine systemd services, logrotate, and Nginx links.")
         print(f"It leaves PostgreSQL databases and the application files in {redmine_root} completely intact.{AnsiColor.RESET}")
 
-        confirm = input("\nType 'YES' to confirm teardown: ").strip()
-        if confirm != "YES":
+        confirm = input("\nConfirm teardown? [Y/n, Default: y]: ").strip().lower()
+        if confirm in ["n", "no"]:
             DualLogger.info("Teardown cancelled.")
             return
 
@@ -1048,14 +1214,32 @@ server {{
 
         SystemInspector.run_command(["systemctl", "daemon-reload"])
 
+        Path(redmine_root / "config" / "puma.rb").unlink(missing_ok=True)
         Path("/etc/nginx/sites-enabled/redmine").unlink(missing_ok=True)
         Path("/etc/nginx/sites-available/redmine").unlink(missing_ok=True)
         Path("/etc/logrotate.d/redmine").unlink(missing_ok=True)
 
+        prod_rb = redmine_root / "config" / "environments" / "production.rb"
+        if prod_rb.exists():
+            text = prod_rb.read_text(encoding="utf-8")
+            text = text.replace("  config.active_job.queue_adapter = :sidekiq\n", "")
+            text = text.replace("config.active_job.queue_adapter = :sidekiq\n", "")
+            target_block = """
+  # ActionMailer Sendmail Delivery Configuration
+  config.action_mailer.delivery_method = :sendmail
+  config.action_mailer.sendmail_settings = {
+    location: '/usr/sbin/sendmail',
+    arguments: '-i -t'
+  }
+"""
+            if target_block in text:
+                text = text.replace(target_block, "")
+            prod_rb.write_text(text, encoding="utf-8")
+
         if SystemInspector.is_service_active("nginx"):
             subprocess.run(["systemctl", "restart", "nginx"], capture_output=True)
 
-        DualLogger.success("Redmine systemd services, logrotate, and Nginx links safely removed.")
+        DualLogger.success("Redmine systemd services, puma.rb, logrotate, and Nginx configurations completely uninstalled.")
 
 
 def prompt_user_installation() -> InstallParams:
@@ -1227,6 +1411,9 @@ def prompt_user_installation() -> InstallParams:
     sendmail_in = input("Configure local Sendmail MTA? (y/n) [Default: n]: ").strip().lower()
     configure_sendmail = sendmail_in == "y"
 
+    ssl_in = input("Enable HTTPS / SSL with self-signed certificate? (y/n) [Default: y]: ").strip().lower()
+    enable_ssl = ssl_in != "n"
+
     # 8. PGroonga Full-Text Search Extension
     print(f"\n{AnsiColor.BOLD}8. PostgreSQL Search Extension (PGroonga):{AnsiColor.RESET}")
     pgroonga_choice = input("Enable PGroonga full-text search extension on Redmine databases? [y/N, Default: N]: ").strip().lower()
@@ -1270,7 +1457,8 @@ def prompt_user_installation() -> InstallParams:
             domain_name=domain_name,
             enable_dev_service=enable_dev,
             enable_test_service=enable_test,
-            configure_sendmail=configure_sendmail
+            configure_sendmail=configure_sendmail,
+            enable_ssl=enable_ssl
         )
     )
 
@@ -1291,7 +1479,6 @@ def execute_full_deployment(manifest_path: Path) -> None:
     installer.step8_precompile_assets()
     installer.step9_enforce_permissions()
     installer.step10_setup_pid_directory()
-    installer.export_manifest()
 
     # Services Deployment (Sections 11 - 19)
     svc_mgr = ServicesManager(svc_params)
@@ -1308,12 +1495,44 @@ def execute_full_deployment(manifest_path: Path) -> None:
 
     SystemInspector.run_command(["systemctl", "restart", "redmine"])
     SystemInspector.run_command(["systemctl", "restart", "sidekiq"])
+    installer.export_manifest(svc_params)
     ServicesManager.run_health_checks(svc_params.puma_port, svc_params.redmine_root)
 
     print(f"\n{AnsiColor.GREEN}{'='*76}")
     print("  PLATINUM REDMINE FULL DEPLOYMENT COMPLETE & OPERATIONAL")
-    print(f"{'='*76}{AnsiColor.RESET}")
-    print(f"Manifest JSON: {manifest_path}")
+    print(f"{'='*76}{AnsiColor.RESET}\n")
+
+    access_proto = "https" if svc_params.enable_ssl else "http"
+    domain_display = svc_params.domain_name if svc_params.domain_name != "_" else "127.0.0.1"
+
+    print(f"{AnsiColor.BOLD}Post-Deployment Access & Operations Instructions:{AnsiColor.RESET}")
+    print(f"  1. Web Access: {access_proto}://{domain_display}/")
+    if svc_params.enable_ssl:
+        print(f"     Note: Since a self-signed SSL certificate is used, your browser will show a warning.")
+        print(f"     Click 'Advanced' -> 'Proceed to {domain_display} (unsafe)' to proceed.")
+    print(f"  2. Service Controls:")
+    print(f"     sudo systemctl status redmine    # Puma Web Server")
+    print(f"     sudo systemctl status sidekiq    # Background Worker")
+    print(f"     sudo systemctl status nginx      # Reverse Proxy")
+
+    if domain_display not in ["127.0.0.1", "localhost", "_"]:
+        subdomain_prefix = domain_display.split(".")[0] if "." in domain_display else domain_display
+        print(f"  3. DNS Records Configuration (Action Required for Public Access):")
+        print(f"     - CNAME Record: In your DNS manager, point:")
+        print(f"         Type: CNAME | Name: {subdomain_prefix} | Target: <your-server-hostname>")
+        print(f"         (Or Type: A | Name: {subdomain_prefix} | Value: <your-server-public-ip>)")
+        print(f"     - Local Testing: Add '127.0.0.1 {domain_display}' to /etc/hosts for instant testing.")
+        print(f"  4. Email Delivery & Mail Records (For Sendmail / ActionMailer):")
+        print(f"     - SPF TXT Record: Authorize this server to send notifications without spam classification:")
+        print(f"         Type: TXT | Name: @ | Value: v=spf1 ip4:<your-server-public-ip> ~all")
+        print(f"     - MX Record: Only required if configuring Redmine to receive incoming email for issues.")
+    else:
+        print(f"  3. Local Testing:")
+        print(f"     - If using a domain like redmine.synorastudio.in later, add CNAME: redmine -> server hostname.")
+        print(f"     - Set up an SPF record (v=spf1 ip4:<SERVER_IP> ~all) if using Sendmail notifications.")
+
+    print(f"  4. Deployment Manifest:")
+    print(f"     {manifest_path.resolve()}\n")
 
 
 def detect_existing_installation(manifest_path: Path) -> dict[str, str] | None:

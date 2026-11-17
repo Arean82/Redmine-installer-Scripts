@@ -1,0 +1,13 @@
+{
+  "operation": "Ruby Environment Provisioning",
+  "timestamp": "2026-11-17T21:24:41.484254+05:30",
+  "target_user": "redmineuser",
+  "target_home": "/home/redmineuser",
+  "rbenv_root": "/home/redmineuser/.rbenv",
+  "shims_dir": "/home/redmineuser/.rbenv/shims",
+  "selected_version": "4.0.9",
+  "verified_ruby": "[Errno 13] Permission denied: '/home/redmineuser/.rbenv/shims/ruby'",
+  "verified_bundler": "[Errno 13] Permission denied: '/home/redmineuser/.rbenv/shims/bundle'",
+  "ruby_executable": "/home/redmineuser/.rbenv/shims/ruby",
+  "bundle_executable": "/home/redmineuser/.rbenv/shims/bundle"
+}

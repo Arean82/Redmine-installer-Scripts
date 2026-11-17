@@ -1,0 +1,40 @@
+{
+    "deployment": "Redmine 7.0.3 Platinum Enterprise Stack",
+    "timestamp": "2026-11-17T21:22:00+05:30",
+    "user": "redmineuser",
+    "ruby_path": "/home/redmineuser/.rbenv/shims/ruby",
+    "bundle_path": "/home/redmineuser/.rbenv/shims/bundle",
+    "redmine_root": "/data/redmine",
+    "services_status": {
+        "postgresql": "active",
+        "redis-server": "active",
+        "redmine": "active",
+        "sidekiq": "active",
+        "nginx": "active"
+    },
+    "puma": {
+        "bind_host": "127.0.0.1",
+        "bind_port": 3300,
+        "config_file": "/data/redmine/config/puma.rb",
+        "systemd_service": "redmine.service",
+        "status": "active"
+    },
+    "sidekiq": {
+        "config_file": "/data/redmine/config/sidekiq.yml",
+        "systemd_service": "sidekiq.service",
+        "status": "active"
+    },
+    "nginx": {
+        "vhost_config": "/etc/nginx/sites-available/redmine",
+        "symlink": "/etc/nginx/sites-enabled/redmine",
+        "port": 80,
+        "status": "active"
+    },
+    "redis": {
+        "status": "active"
+    },
+    "database": {
+        "engine": "postgresql",
+        "status": "active"
+    }
+}
